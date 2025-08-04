@@ -5,8 +5,6 @@ import psutil
 from numba import njit
 
 app = Flask(__name__)
-CORS(app)
-
 # Optimized distance sum using Numba
 @njit
 def pairwise_distance_sum(coords):
