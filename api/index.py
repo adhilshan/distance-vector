@@ -3,8 +3,10 @@ import numpy as np
 import time
 import psutil
 from numba import njit
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 # Optimized distance sum using Numba
 @njit
 def pairwise_distance_sum(coords):
