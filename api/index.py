@@ -108,7 +108,7 @@ def calculate_grouped_distances():
         results.append({
             "id": group_id,
             "points_count": int(np_coords.shape[0]),
-            "distance_km": round(dist_km, 6),
+            "distance": round(dist_km, 6),
             "latlon_swapped_fixed": bool(swapped)
         })
 
