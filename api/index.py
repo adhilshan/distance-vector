@@ -1,141 +1,133 @@
-# app.py
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import numpy as np
 import time
 import psutil
 from numba import njit
+from flask_cors import CORS
 import math
 
 app = Flask(__name__)
 CORS(app)
 
-# ---------------------------
-# Numba-accelerated Haversine
-# ---------------------------
+# NOTE: keeping original function name so you don't have to change calls elsewhere.
+# This now computes the route distance (sum of consecutive haversine distances in KM)
+# for GPS coords (lat, lon) provided in the input.
 @njit
-def haversine_km(lat1, lon1, lat2, lon2):
-    # Earth radius in km
-    R = 6371.0
-    # convert decimal degrees to radians
-    phi1 = lat1 * (math.pi / 180.0)
-    phi2 = lat2 * (math.pi / 180.0)
-    dphi = (lat2 - lat1) * (math.pi / 180.0)
-    dlambda = (lon2 - lon1) * (math.pi / 180.0)
-    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    return 2.0 * R * math.asin(math.sqrt(a))
-
-@njit
-def route_length_km_numba(coords):
-    # coords: Nx2 float64 array where coords[:,0]=lat, coords[:,1]=lon
+def pairwise_distance_sum(coords):
+    """
+    coords: Nx2 float64 numpy array with [lat, lon] in decimal degrees.
+    Returns route length in kilometers (sum of distances between consecutive points).
+    """
     n = coords.shape[0]
     if n < 2:
         return 0.0
     total = 0.0
+    R = 6371.0  # Earth radius in km
     for i in range(n - 1):
-        total += haversine_km(coords[i, 0], coords[i, 1], coords[i+1, 0], coords[i+1, 1])
+        lat1 = coords[i, 0] * (math.pi / 180.0)
+        lon1 = coords[i, 1] * (math.pi / 180.0)
+        lat2 = coords[i + 1, 0] * (math.pi / 180.0)
+        lon2 = coords[i + 1, 1] * (math.pi / 180.0)
+
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+        # safe clamp for numeric stability
+        c = 2.0 * math.asin(min(1.0, math.sqrt(a)))
+        total += R * c
     return total
 
-# ---------------------------
-# Helpers (non-numba)
-# ---------------------------
 def detect_and_fix_latlon_order(np_coords):
     """
-    Heuristic: If many values in column 0 are outside [-90, 90] (invalid lat),
-    assume coordinates are in order [lon, lat] and swap to [lat, lon].
-    Returns fixed array and a flag indicating whether swap occurred.
+    Heuristic to detect if coords are [lon, lat] instead of [lat, lon].
+    If more than half values in column 0 are outside [-90, 90], swap columns.
+    Returns (fixed_array, swapped_flag)
     """
     col0 = np_coords[:, 0]
-    invalid_lat_count = np.sum((col0 < -90) | (col0 > 90))
-    # if more than half values are invalid as lat, swap columns
+    invalid_lat_count = np.sum((col0 < -90.0) | (col0 > 90.0))
     if invalid_lat_count > (len(col0) // 2):
+        # swap columns
         fixed = np_coords[:, ::-1].copy()
         return fixed, True
     return np_coords, False
 
-# ---------------------------
-# Flask endpoint
-# ---------------------------
 @app.route('/ektruck/calculate', methods=['POST'])
 def calculate_grouped_distances():
-    start = time.time()
-    process = psutil.Process()
-    mem_before = process.memory_info().rss / (1024 * 1024)  # MB
-    cpu_before = psutil.cpu_percent(interval=None)
-
     data = request.get_json()
-    if data is None:
-        return jsonify({"error": "Invalid JSON or empty body"}), 400
 
-    # Accept both a single group object or list of groups
-    groups = data if isinstance(data, list) else [data]
+    if not isinstance(data, list):
+        return jsonify({"error": "Input should be a list of groups with 'id' and 'coordinates'"}), 400
 
+    process = psutil.Process()
+    cpu_before = psutil.cpu_percent(interval=None)
+    mem_before = process.memory_info().rss / (1024 * 1024)  # MB
+
+    start = time.time()
     results = []
     total_points = 0
 
-    for group in groups:
-        group_id = group.get("id", None)
-        coords = group.get("coordinates", None)
+    for group in data:
+        group_id = group.get("id")
+        coords = group.get("coordinates")
 
-        if coords is None:
-            results.append({"id": group_id, "error": "no coordinates provided"})
+        if not group_id or not coords:
             continue
 
-        # Try to coerce into a Nx2 float64 numpy array
+        # Force float64 (important for Numba) and validate shape
         try:
             np_coords = np.array(coords, dtype=np.float64)
         except Exception as e:
-            results.append({"id": group_id, "error": f"invalid coordinate format: {str(e)}"})
+            results.append({
+                "id": group_id,
+                "distance": None,
+                "error": f"invalid coordinate format: {e}"
+            })
             continue
 
-        # Validate shape
         if np_coords.ndim != 2 or np_coords.shape[1] != 2:
-            results.append({"id": group_id, "error": "coordinates must be list of [lat, lon] pairs"})
+            results.append({
+                "id": group_id,
+                "distance": None,
+                "error": "coordinates must be Nx2 array of [lat, lon]"
+            })
             continue
 
-        # Fix ordering if necessary (lon,lat -> lat,lon)
+        # Fix ordering if client sent [lon, lat]
         np_coords, swapped = detect_and_fix_latlon_order(np_coords)
 
-        # compute route distance in km (consecutive points)
+        # compute route distance (consecutive points) in kilometers using numba
         try:
-            dist_km = float(route_length_km_numba(np_coords))
+            dist_km = pairwise_distance_sum(np_coords)
         except Exception as e:
-            # fallback to python implementation if numba compilation fails
+            # In case Numba compilation fails at runtime, fallback to a safe python haversine
             dist_km = 0.0
             for i in range(np_coords.shape[0] - 1):
-                dist_km += _haversine_km_py(np_coords[i,0], np_coords[i,1], np_coords[i+1,0], np_coords[i+1,1])
-
-        results.append({
-            "id": group_id,
-            "points_count": int(np_coords.shape[0]),
-            "distance": round(dist_km, 6),
-            "latlon_swapped_fixed": bool(swapped)
-        })
+                lat1, lon1 = np_coords[i]
+                lat2, lon2 = np_coords[i+1]
+                # pure-python haversine (km)
+                phi1 = math.radians(lat1)
+                phi2 = math.radians(lat2)
+                dphi = math.radians(lat2 - lat1)
+                dlambda = math.radians(lon2 - lon1)
+                a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+                c = 2.0 * math.asin(min(1.0, math.sqrt(a)))
+                dist_km += 6371.0 * c
 
         total_points += int(np_coords.shape[0])
+        results.append({
+            "id": group_id,
+            # keep same key name as original; distance now in kilometers
+            "distance": round(float(dist_km), 4)
+        })
 
+    end = time.time()
     cpu_after = psutil.cpu_percent(interval=None)
     mem_after = process.memory_info().rss / (1024 * 1024)  # MB
-    end = time.time()
 
     return jsonify({
         "cpu_percent_used": cpu_after,
         "peak_memory_mb": round(mem_after - mem_before, 4),
         "points_count": total_points,
-        "results": results,
-        "time_taken_sec": round(end - start, 6)
+        "sum_of_distances": results,
+        "time_taken_sec": round(end - start, 4)
     })
-
-
-# ---------------------------
-# Pure-python fallback haversine (used only on exception)
-# ---------------------------
-def _haversine_km_py(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    return 2.0 * R * math.asin(math.sqrt(a))
-
